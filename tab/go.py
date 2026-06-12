@@ -1,812 +1,710 @@
-import importlib
+import datetime
 import json
-import threading
+import os
+import platform
 import time
 import uuid
-from datetime import datetime
-from json import JSONDecodeError
-from urllib.parse import urlencode, quote
-
 import gradio as gr
-import qrcode
-import retry
 from gradio import SelectData
 from loguru import logger
-from requests import HTTPError, RequestException
+import requests
 
-from config import global_cookieManager, main_request, configDB, time_service
-from geetest.CapSolverValidator import CapSolverValidator
-from geetest.NormalValidator import NormalValidator
-from geetest.RROCRValidator import RROCRValidator
-from util import PlusUtil
-from util.dynimport import bili_ticket_gt_python
-from util.error import ERRNO_DICT, withTimeString
-from util.order_qrcode import get_qrcode_url
-
-import os
-import pygame
-
-ways = ["手动", "使用 rrocr", "使用 CapSolver"]
-ways_detail = [NormalValidator(), RROCRValidator(), CapSolverValidator()]
-if bili_ticket_gt_python is not None:
-    tmp = importlib.import_module("geetest.AmorterValidator").AmorterValidator()
-    ways_detail.append(tmp)
-    ways.append("本地过验证码（Amorter提供）")
+from task.buy import buy_new_terminal
+from util import ConfigDB, Endpoint, GlobalStatusInstance, LOG_DIR, time_service
 
 
-def format_dictionary_to_string(data):
-    formatted_string_parts = []
-    for key, value in data.items():
-        if isinstance(value, list) or isinstance(value, dict):
-            formatted_string_parts.append(
-                f"{quote(key)}={quote(json.dumps(value, separators=(',', ':'), ensure_ascii=False))}"
+def withTimeString(string):
+    return f"{datetime.datetime.now()}: {string}"
+
+
+def _build_task_log_path(filename: str) -> str:
+    filename_only = os.path.splitext(os.path.basename(filename))[0]
+    safe_name = "".join(
+        ch if ch.isalnum() or ch in "-_." else "_" for ch in filename_only
+    )
+    safe_name = safe_name.strip("._") or "task"
+    return os.path.join(LOG_DIR, f"{safe_name}_{uuid.uuid4().hex[:8]}.log")
+
+
+def _parse_sale_start(value) -> datetime.datetime | None:
+    if isinstance(value, (int, float)):
+        return datetime.datetime.fromtimestamp(value)
+    if isinstance(value, str) and value.strip():
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+            try:
+                return datetime.datetime.strptime(value, fmt)
+            except ValueError:
+                continue
+    return None
+
+
+def go_tab(demo: gr.Blocks):
+    with gr.Column(elem_classes="btb-page-section"):
+        with gr.Column(elem_classes="btb-card btb-card-sky btb-layout-card"):
+            gr.Markdown(
+                """
+                <div class="flex flex-wrap items-start justify-between gap-3">
+                    <div>
+                        <p class="text-lg font-semibold text-slate-900">启动抢票</p>
+                        <p class="mt-2 text-sm leading-6 text-slate-600">
+                            上传一个或多个配置文件，设置抢票时间后即可批量启动任务。
+                        </p>
+                    </div>
+                    <span class="rounded-full border border-sky-200 bg-white px-3 py-1 text-xs font-medium text-sky-700">
+                        抢票入口
+                    </span>
+                </div>
+                """,
+                elem_classes="!p-0",
             )
-        else:
-            formatted_string_parts.append(f"{quote(key)}={quote(str(value))}")
+            with gr.Row(elem_classes="!items-stretch !gap-3"):
+                upload_ui = gr.Files(
+                    label="上传多个配置文件,每一个上传的文件都会启动一个抢票程序",
+                    file_count="multiple",
+                    scale=5,
+                )
+                ticket_ui = gr.TextArea(
+                    label="查看",
+                    info="只能通过上传文件方式上传信息",
+                    interactive=False,
+                    visible=False,
+                    scale=4,
+                )
+            with gr.Column(elem_classes="btb-card btb-card-sky btb-layout-card"):
+                gr.HTML(
+                    """
+                    <div class="btb-card-head">
+                        <div>
+                            <div class="btb-card-head__eyebrow">Schedule</div>
+                            <h3>选择抢票时间</h3>
+                            <p>
+                                程序已经提前帮你校准时间，请设置成<strong>开票时间</strong>。
+                                切勿设置为开票前时间，否则有封号风险。
+                            </p>
+                        </div>
+                        <span class="btb-badge-pink">精确到秒</span>
+                    </div>
+                    """,
+                    label="选择抢票的时间",
+                )
 
-    formatted_string = "&".join(formatted_string_parts)
-    return formatted_string
-
-
-def go_tab():
-    isRunning = False
-
-    gr.Markdown("""
-> **分享一下经验**
-> - 抢票前，不要去提前抢还没有发售的票，会被b站封掉一段时间导致错过抢票的
-> - 热门票要提前练习过验证码
-> - 如果要使用自动定时抢，电脑的时间和b站的时间要一致
-> - 使用不同的多个账号抢票 （可以每一个exe文件都使用不同的账号， 或者在使用这个程序的时候，手机使用其他的账号去抢）
-> - 程序能保证用最快的速度发送订单请求，但是不保证这一次订单请求能够成功。所以不要完全依靠程序
-> - 现在各个平台抢票和秒杀机制都是进抽签池抽签，网速快发请求多快在拥挤的时候基本上没有效果
-> 此时就要看你有没有足够的设备和账号来提高中签率
-> - 欢迎前往[discussions](https://github.com/mikumifa/biliTickerBuy/discussions) 分享你的经验
-""")
-    with gr.Column():
-        gr.Markdown(
-            """
-            ### 上传或填入你要抢票票种的配置信息
-            """
-        )
-        with gr.Row(equal_height=True):
-            upload_ui = gr.Files(label="上传多个配置文件，点击不同的配置文件可快速切换", file_count="multiple")
-            ticket_ui = gr.TextArea(
-                label="填入配置",
-                info="再次填入配置信息 （不同版本的配置文件可能存在差异，升级版本时候不要偷懒，老版本的配置文件在新版本上可能出问题",
-                interactive=True
-            )
-        gr.HTML(
-            """<label for="datetime">选择抢票的时间</label><br>
-                <input type="datetime-local" id="datetime" name="datetime" step="1">""",
-            label="选择抢票的时间",
-            show_label=True,
-        )
+                gr.HTML(
+                    """
+                    <div class="btb-time-picker-card">
+                        <label class="btb-time-picker-card__label" for="datetime">
+                            抢票开始时间
+                        </label>
+                        <input
+                            type="datetime-local"
+                            id="datetime"
+                            name="datetime"
+                            step="1"
+                            class="btb-native-datetime-input"
+                        >
+                        <p class="btb-time-picker-card__hint">
+                            会根据已上传配置自动检查每个票档的起售时间，并回填可安全开抢的时间点。
+                        </p>
+                    </div>
+                    """
+                )
+            with gr.Row(elem_classes="!justify-end"):
+                auto_fill_time_btn = gr.Button(
+                    "自动填写抢票时间",
+                    elem_classes="btb-soft-button",
+                    scale=0,
+                    min_width=220,
+                )
 
         def upload(filepath):
             try:
-                with open(filepath[0], 'r', encoding="utf-8") as file:
+                with open(filepath[0], "r", encoding="utf-8") as file:
                     content = file.read()
-                return content
+                return gr.update(content, visible=True)
             except Exception as e:
                 return str(e)
 
         def file_select_handler(select_data: SelectData, files):
             file_label = files[select_data.index]
             try:
-                with open(file_label, 'r', encoding="utf-8") as file:
+                with open(file_label, "r", encoding="utf-8") as file:
                     content = file.read()
                 return content
             except Exception as e:
                 return str(e)
 
         upload_ui.upload(fn=upload, inputs=upload_ui, outputs=ticket_ui)
+        upload_ui.clear(
+            fn=lambda x: gr.update("", visible=False),
+            inputs=upload_ui,
+            outputs=ticket_ui,
+        )
+
         upload_ui.select(file_select_handler, upload_ui, ticket_ui)
 
-        # 手动设置/更新时间偏差
-        with gr.Accordion(label='手动设置/更新时间偏差', open=False):
-            time_diff_ui = gr.Number(label="当前脚本时间偏差 (单位: ms)",
-                               info="你可以在这里手动输入时间偏差, 或点击下面按钮自动更新当前时间偏差。正值将推迟相应时间开始抢票, 负值将提前相应时间开始抢票。",
-                               value=format(time_service.get_timeoffset()*1000, '.2f'))
-            refresh_time_ui = gr.Button(value="点击自动更新时间偏差")
-            refresh_time_ui.click(fn=lambda:format(float(time_service.compute_timeoffset())*1000, '.2f'),inputs=None, outputs=time_diff_ui)
-            time_diff_ui.change(fn=lambda x:time_service.set_timeoffset(format(float(x)/1000,'.5f')), inputs=time_diff_ui, outputs=None)
+        def auto_fill_time(files):
+            if not files:
+                gr.Warning("请先上传至少一个抢票配置文件。")
+                return ""
 
-        # 验证码选择
+            sale_start_items: list[tuple[str, datetime.datetime]] = []
+            adjusted_now = datetime.datetime.fromtimestamp(
+                time.time() + time_service.get_timeoffset()
+            )
 
-        way_select_ui = gr.Radio(ways, label="过验证码的方式", info="详细说明请前往 `训练你的验证码速度` 那一栏",
-                                 type="index", value="手动")
-        api_key_input_ui = gr.Textbox(label="填写你的api_key",
-                                      value=global_cookieManager.get_config_value("appkey", ""),
-                                      visible=False)
-        phone_gate_ui = gr.Textbox(label="填写你的当前账号所绑定的手机",
-                                   info="可能会出现手机验证码验证",
-                                   value=global_cookieManager.get_config_value("phone", ""))
+            for filepath in files:
+                with open(filepath, "r", encoding="utf-8") as file:
+                    config = json.load(file)
 
-        with gr.Accordion("验证码预填设置[可选]", open=False):
+                sale_start = _parse_sale_start(
+                    config.get("sale_start", config.get("saleStart"))
+                )
+                if sale_start is None:
+                    raise gr.Error(
+                        f"{os.path.basename(filepath)} 缺少有效的 sale_start，请重新生成该配置。"
+                    )
+                sale_start_items.append((os.path.basename(filepath), sale_start))
+
+            latest_sale_start = max(sale_start for _, sale_start in sale_start_items)
+            unique_sale_starts = sorted(
+                {sale_start for _, sale_start in sale_start_items}
+            )
+            if latest_sale_start <= adjusted_now:
+                gr.Warning("已经过起售时间，不需要填写抢票时间。\n")
+                return ""
+
+            autofill_value = latest_sale_start.strftime("%Y-%m-%dT%H:%M:%S")
+            if len(unique_sale_starts) == 1:
+                gr.Info("已自动填写抢票时间。\n")
+                return autofill_value
+
+            gr.Warning(
+                "抢票的起始时间不一样，已自动填写为最晚的起售时间，确保所有票档届时都已开始抢票。\n"
+            )
+            return autofill_value
+
+        with gr.Accordion(
+            label="高级设置",
+            open=False,
+            elem_classes="btb-card btb-soft-accordion",
+        ):
             gr.Markdown(
                 """
-                ### 请注意阅读下方注意事项
-                - 在这里, 你可以上传或者填入要抢票的票仓下其他已开票/已售罄的票种配置文件(填入其他票仓的配置文件是无效的)来辅助抢票。脚本会使用该配置文件提前请求验证码, 降低抢票时遇到验证码的概率
-                - 请注意: 你需要在配置选项卡下, 选择你要抢的票仓中**其它已售罄或者已开票还未售罄**的票种来生成配置文件填入这里, 选择不可售的票种配置文件填入这里**可能会被风控**
-                - 你可以通过修改下方的"验证码提前预填时间", 来配置提前多长时间开始预填验证码
-                - 在距抢票开始时间不足30秒时, 为避免影响正常开票时抢票, 验证码预填功能将不会启用
-                - 如不需要使用验证码预填功能, 此处请留空
-                """
+                <div class="flex flex-wrap items-start justify-between gap-3">
+                    <div>
+                        <p class="text-base font-semibold text-slate-900">高级设置</p>
+                        <p class="mt-1 text-sm leading-6 text-slate-600">
+                            这里包含代理、成功提醒、提示音和杂项选项。大多数情况下不需要展开修改。
+                        </p>
+                    </div>
+                    <span class="rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-xs font-medium text-slate-600">
+                        可选配置
+                    </span>
+                </div>
+                """,
+                elem_classes="!p-0",
             )
-            with gr.Row(equal_height=True):
-                authcode_prepare_file_ui = gr.Files(label="上传多个配置文件，点击不同的配置文件可快速切换",
-                                                    file_count="multiple"
-                                                    )
-                authcode_prepare_text_ui = gr.TextArea(
-                    label="填入配置",
-                    info="再次填入配置信息。不同版本的配置文件可能存在差异，升级版本时候不要偷懒，老版本的配置文件在新版本上可能出问题",
-                    interactive=True
+
+            with gr.Accordion(
+                label="填写你的代理服务器[可选]",
+                open=False,
+                elem_classes="!rounded-2xl !border !border-slate-200 !bg-white !shadow-sm",
+            ):
+                gr.Markdown("""
+                        > **注意**：
+
+                        填写代理服务器地址后，程序在使用这个配置文件后会在出现风控后后根据代理服务器去访问哔哩哔哩的抢票接口。
+
+                        抢票前请确保代理服务器已经开启，并且可以正常访问哔哩哔哩的抢票接口。
+
+                        支持 HTTP/HTTPS/SOCKS 代理。
+
+                        """)
+
+                def get_latest_proxy():
+                    return ConfigDB.get("https_proxy") or ""
+
+                https_proxy_ui = gr.Textbox(
+                    label="填写抢票时候的代理服务器地址，使用逗号隔开|输入完成后，回车键保存",
+                    info="例如： http://127.0.0.1:8080,https://127.0.0.1:8081,socks5://127.0.0.1:1080",
+                    value=(ConfigDB.get("https_proxy") or ""),
                 )
-            authcode_preorder_time_ui = gr.Number(label="验证码提前预填时间(单位: 秒)",
-                                                  info="设置在正式抢票之前多秒开始预填验证码, 最小值为30秒",
-                                                  minimum=30,
-                                                  value=180)
-            authcode_prepare_file_ui.upload(fn=upload, inputs=authcode_prepare_file_ui,
-                                            outputs=authcode_prepare_text_ui)
-            authcode_prepare_file_ui.select(fn=file_select_handler, inputs=authcode_prepare_file_ui,
-                                            outputs=authcode_prepare_text_ui)
-            
-        with gr.Accordion(label='抢票成功声音提醒[可选]',open=False):
-            with gr.Row():
-                audio_path_ui = gr.File(label="选择一个MP3/WAV音频作为提醒声音 (如不需要抢票成功声音提醒此处无需上传文件)", type="filepath")
-                audio_repeat_times_ui = gr.Number(label='音频重复播放次数',value = 1, minimum = 1, step = 1)
-            audio_start_ui = gr.Button("播放音频进行试听")
-            audio_stop_ui = gr.Button("停止播放")
 
-            def audio_control(status_flag, audio_path=None):
-                if status_flag == "start" and audio_path != None:
-                    pygame.mixer.init()
-                    pygame.mixer.music.load(os.path.abspath(audio_path))
-                    pygame.mixer.music.play()
-                if status_flag == "stop":
-                    pygame.mixer.music.stop()
+                def input_https_proxy(_https_proxy):
+                    ConfigDB.insert("https_proxy", _https_proxy)
+                    return gr.update(ConfigDB.get("https_proxy"))
 
-            audio_start_ui.click(fn=audio_control,inputs=[gr.Text(value="start",visible=False),audio_path_ui],outputs=None)
-            audio_stop_ui.click(fn=audio_control,inputs=[gr.Text(value="stop",visible=False)],outputs=None)
+                https_proxy_ui.submit(
+                    fn=input_https_proxy, inputs=https_proxy_ui, outputs=https_proxy_ui
+                )
 
+                test_proxy_btn = gr.Button(
+                    "🔍 测试代理连通性",
+                    elem_classes="btb-soft-button",
+                )
+                test_timeout_ui = gr.Number(
+                    label="测试代理超时时间(秒)",
+                    value=10,
+                    minimum=5,
+                    maximum=60,
+                    step=1,
+                )
 
-        def input_phone(_phone):
-            global_cookieManager.set_config_value("phone", _phone)
+                test_result_ui = gr.Textbox(
+                    label="测试结果",
+                    lines=10,
+                    max_lines=15,
+                    interactive=False,
+                    placeholder="点击上方按钮开始测试代理连通性...",
+                )
 
-        phone_gate_ui.change(fn=input_phone, inputs=phone_gate_ui, outputs=None)
-        select_way = 0
+                def test_proxy_connectivity(proxy_string, timeout):
+                    """测试代理连通性"""
+                    try:
+                        from util.ProxyTester import test_proxy_connectivity
 
-        def choose_option(way):
-            nonlocal select_way
-            select_way = way
-            if ways_detail[select_way].need_api_key():
-                return gr.update(visible=True)
-            else:
-                return gr.update(visible=False)
+                        if not proxy_string or proxy_string.strip() == "":
+                            proxy_string = "none"  # 测试直连
+                        result = test_proxy_connectivity(proxy_string, int(timeout))
+                        return result
+                    except Exception as e:
+                        return f"❌ 测试过程中发生错误: {str(e)}"
 
-        way_select_ui.change(choose_option, inputs=way_select_ui, outputs=api_key_input_ui)
-        with gr.Row():
+                test_proxy_btn.click(
+                    fn=test_proxy_connectivity,
+                    inputs=[https_proxy_ui, test_timeout_ui],
+                    outputs=test_result_ui,
+                )
 
-            gt = ""
-            challenge = ""
-            geetest_validate = ""
-            geetest_seccode = ""
+            with gr.Accordion(
+                label="配置抢票成功后播放音乐[可选]",
+                open=False,
+                elem_classes="!rounded-2xl !border !border-slate-200 !bg-white !shadow-sm",
+            ):
+                with gr.Row(elem_classes="btb-inline-actions !justify-end"):
+                    audio_path_ui = gr.Audio(
+                        label="上传提示声音[只支持格式wav]",
+                        type="filepath",
+                        loop=True,
+                        value=(ConfigDB.get("audioPath") or None),
+                    )
 
+            with gr.Accordion(
+                label="配置抢票推送消息[可选]",
+                open=False,
+                elem_classes="!rounded-2xl !border !border-slate-200 !bg-white !shadow-sm",
+            ):
+                gr.Markdown(
+                    """
+                    🗨️ **抢票成功提醒**
+        
+                    > 你需要去对应的网站获取 key 或 token，然后填入下面的输入框  
+                    > [Server酱<sup>Turbo</sup>](https://sct.ftqq.com/sendkey) | [pushplus](https://www.pushplus.plus/uc.html) | [Server酱<sup>3</sup>](https://sc3.ft07.com/sendkey) | [ntfy](https://ntfy.sh/) | [Bark](https://bark.day.app/)  
+                    > 留空以不启用提醒功能
+        
+                    ### 🔍 推送服务对比
+        
+                    | 服务     | 优点                               | 缺点                            |
+                    |----------|------------------------------------|---------------------------------|
+                    | Server酱<sup>Turbo</sup> | 简单易用，微信推送              | 微信推送很难看到 |
+                    | pushplus | 简单易用，微信推送| 微信推送很难看到               |
+                    | Server酱<sup>3</sup> | APP推送，有中文文档              | 配置复杂 |
+                    | ntfy     | APP推送, 功能强大, 支持长期响铃 | 配置复杂，需要手动搭建或注册公网地址 |
+                    | Bark     | iOS通知推送，配置简单，无视静音和勿扰模式，支持APP跳转 | 仅支持iOS设备 |
+        
+                    ✅ 推荐：初次使用建议选择 **pushplus** 或 **Server酱ᵀᵘʳᵇᵒ**，配置最简单  
+                    🍎 iOS用户推荐使用 **Bark**，通知效果最佳  
+                    🛠️ 追求高度自由/有自建服务器/需要在抢票成功时通过手机播放铃声时，建议用 **ntfy** 或 **Server酱³**
+                    """
+                )
+                serverchan_ui = gr.Textbox(
+                    value=(ConfigDB.get("serverchanKey") or ""),
+                    label="Server酱ᵀᵘʳᵇᵒ的SendKey｜输入完成后，回车键保存",
+                    interactive=True,
+                    info="https://sct.ftqq.com/",
+                )
+
+                serverchan3_ui = gr.Textbox(
+                    value=(ConfigDB.get("serverchan3ApiUrl") or ""),
+                    label="Server酱³的API URL｜输入完成后，回车键保存",
+                    interactive=True,
+                    info="https://sc3.ft07.com/",
+                )
+
+                pushplus_ui = gr.Textbox(
+                    value=(ConfigDB.get("pushplusToken") or ""),
+                    label="PushPlus的Token｜输入完成后，回车键保存",
+                    interactive=True,
+                    info="https://www.pushplus.plus/",
+                )
+
+                bark_ui = gr.Textbox(
+                    value=(ConfigDB.get("barkToken") or ""),
+                    label="Bark的Token｜输入完成后，回车键保存",
+                    interactive=True,
+                    info='iOS Bark App的"服务器"页面获取，例如: jmGYK*****(并非Device Token)；自托管服务请输入完整推送地址，例如: https://bark.example.app/jmGYK*****',
+                )
+
+                with gr.Accordion(
+                    label="Ntfy配置",
+                    open=False,
+                    elem_classes="!rounded-2xl !border !border-slate-200 !bg-slate-50 !shadow-sm",
+                ):
+                    ntfy_ui = gr.Textbox(
+                        value=(ConfigDB.get("ntfyUrl") or ""),
+                        label="Ntfy服务器URL｜输入完成后，回车键保存",
+                        interactive=True,
+                        info="例如: https://ntfy.sh/your-topic",
+                    )
+
+                    with gr.Accordion(
+                        label="Ntfy认证配置[可选]",
+                        open=False,
+                        elem_classes="!rounded-2xl !border !border-slate-200 !bg-white !shadow-sm",
+                    ):
+                        with gr.Row(elem_classes="btb-inline-actions !justify-end"):
+                            ntfy_username_ui = gr.Textbox(
+                                value=(ConfigDB.get("ntfyUsername") or ""),
+                                label="Ntfy用户名",
+                                interactive=True,
+                                info="如果你的Ntfy服务器需要认证",
+                            )
+
+                            ntfy_password_ui = gr.Textbox(
+                                value=(ConfigDB.get("ntfyPassword") or ""),
+                                label="Ntfy密码",
+                                interactive=True,
+                                type="password",
+                            )
+
+                        def test_ntfy_connection():
+                            url = ConfigDB.get("ntfyUrl")
+                            username = ConfigDB.get("ntfyUsername")
+                            password = ConfigDB.get("ntfyPassword")
+
+                            if not url:
+                                return "错误: 请先设置Ntfy服务器URL"
+
+                            from util import NtfyUtil
+
+                            success, message = NtfyUtil.test_connection(
+                                url, username, password
+                            )
+
+                            if success:
+                                return f"成功: {message}"
+                            else:
+                                return f"错误: {message}"
+
+                        test_ntfy_button = gr.Button(
+                            "测试Ntfy连接",
+                            elem_classes="btb-soft-button",
+                        )
+                        test_ntfy_result = gr.Textbox(
+                            label="测试结果", interactive=False
+                        )
+                        test_ntfy_button.click(
+                            fn=test_ntfy_connection, inputs=[], outputs=test_ntfy_result
+                        )
+
+                # 推送测试按钮区域
+                with gr.Column(elem_classes="btb-card btb-card-sky btb-layout-card"):
+                    test_all_push_button = gr.Button(
+                        "🧪 测试所有推送",
+                        elem_classes="!rounded-xl !border !border-slate-300 !bg-white !text-slate-900 !shadow-sm hover:!bg-slate-100 !transition",
+                    )
+                    test_push_result = gr.Textbox(
+                        label="推送测试结果", interactive=False
+                    )
+
+            def inner_input_serverchan(x):
+                ConfigDB.insert("serverchanKey", x)
+                return gr.update(value=ConfigDB.get("serverchanKey"))
+
+            def inner_input_serverchan3(x):
+                ConfigDB.insert("serverchan3ApiUrl", x)
+                return gr.update(value=ConfigDB.get("serverchan3ApiUrl"))
+
+            def inner_input_pushplus(x):
+                ConfigDB.insert("pushplusToken", x)
+                return gr.update(value=ConfigDB.get("pushplusToken"))
+
+            def inner_input_bark(x):
+                ConfigDB.insert("barkToken", x)
+                return gr.update(value=ConfigDB.get("barkToken"))
+
+            def inner_input_ntfy(x):
+                ConfigDB.insert("ntfyUrl", x)
+                return gr.update(value=ConfigDB.get("ntfyUrl"))
+
+            def inner_input_ntfy_username(x):
+                ConfigDB.insert("ntfyUsername", x)
+                return gr.update(value=ConfigDB.get("ntfyUsername"))
+
+            def inner_input_ntfy_password(x):
+                ConfigDB.insert("ntfyPassword", x)
+                return gr.update(value=ConfigDB.get("ntfyPassword"))
+
+            def inner_input_audio_path(x):
+                ConfigDB.insert("audioPath", x)
+                return gr.update(value=ConfigDB.get("audioPath"))
+
+            def test_all_push():
+                """调用NotifierManager统一测试所有推送渠道"""
+                try:
+                    from util.Notifier import NotifierManager
+
+                    return NotifierManager.test_all_notifiers()
+                except Exception as e:
+                    logger.exception(e)
+                    return f"错误: 测试过程中发生异常 - {str(e)}"
+
+            serverchan_ui.submit(
+                fn=inner_input_serverchan, inputs=serverchan_ui, outputs=serverchan_ui
+            )
+
+            serverchan3_ui.submit(
+                fn=inner_input_serverchan3,
+                inputs=serverchan3_ui,
+                outputs=serverchan3_ui,
+            )
+
+            pushplus_ui.submit(
+                fn=inner_input_pushplus, inputs=pushplus_ui, outputs=pushplus_ui
+            )
+
+            bark_ui.submit(fn=inner_input_bark, inputs=bark_ui, outputs=bark_ui)
+
+            ntfy_ui.submit(fn=inner_input_ntfy, inputs=ntfy_ui, outputs=ntfy_ui)
+
+            ntfy_username_ui.submit(
+                fn=inner_input_ntfy_username,
+                inputs=ntfy_username_ui,
+                outputs=ntfy_username_ui,
+            )
+
+            ntfy_password_ui.submit(
+                fn=inner_input_ntfy_password,
+                inputs=ntfy_password_ui,
+                outputs=ntfy_password_ui,
+            )
+
+            test_all_push_button.click(
+                fn=test_all_push, inputs=[], outputs=test_push_result
+            )
+
+            audio_path_ui.upload(
+                fn=inner_input_audio_path, inputs=audio_path_ui, outputs=audio_path_ui
+            )
+            with gr.Accordion(
+                label="杂项配置",
+                open=False,
+                elem_classes="!rounded-2xl !border !border-slate-200 !bg-white !shadow-sm",
+            ):
+                show_random_message_ui = gr.Checkbox(
+                    label="关闭群友语录",
+                    value=True,
+                    info="关闭后，抢票失败时将不再显示有趣的语录",
+                )
+
+        with gr.Row(elem_classes="btb-inline-actions !justify-end"):
             interval_ui = gr.Number(
                 label="抢票间隔",
-                value=300,
+                value=1000,
                 minimum=1,
-                info="设置抢票任务之间的时间间隔（单位：毫秒），建议不要设置太小",
+                info="设置抢票请求之间的时间间隔（单位：毫秒），建议不要设置太小",
             )
-            mode_ui = gr.Radio(
-                label="抢票模式",
-                choices=["无限", "有限"],
-                value="无限",
-                info="选择抢票的模式",
-                type="index",
+            choices = ["网页"]
+            if platform.system() == "Windows":
+                choices.insert(0, "终端")  # 或 append，取决于你想要顺序
+            terminal_ui = gr.Radio(
+                label="日志显示方式",
+                choices=choices,
+                value=choices[0],
+                info="日志显示的方式,非windows用戶只支持網頁",
+                type="value",
                 interactive=True,
             )
-            total_attempts_ui = gr.Number(
-                label="总过次数",
-                value=100,
-                minimum=1,
-                info="设置抢票的总次数",
-                visible=False,
-            )
 
-    validate_con = threading.Condition()
+    def try_assign_endpoint(endpoint_url, payload):
+        try:
+            response = requests.post(f"{endpoint_url}/buy", json=payload, timeout=5)
+            if response.status_code == 200:
+                return True
+            elif response.status_code == 409:
+                logger.info(f"{endpoint_url} 已经占用")
+                return False
+            else:
+                return False
 
-    def start_go(tickets_info_str, authcode_prepare_str, authcode_preorder_time, time_start, interval, mode,
-                 total_attempts, api_key, audio_path, audio_repeat_times):
-        nonlocal geetest_validate, geetest_seccode, gt, challenge, isRunning
-        isRunning = True
-        left_time = total_attempts
+        except Exception as e:
+            logger.exception(e)
+            raise e
+
+    def split_proxies(https_proxy_list: list[str], task_num: int) -> list[list[str]]:
+        assigned_proxies: list[list[str]] = [[] for _ in range(task_num)]
+        for i, proxy in enumerate(https_proxy_list):
+            assigned_proxies[i % task_num].append(proxy)
+        return assigned_proxies
+
+    def start_go(
+        files,
+        time_start,
+        interval,
+        audio_path,
+        https_proxys,
+        terminal_ui,
+        hide_random_message,
+    ):
+        if not files:
+            return [gr.update(value=withTimeString("未提交抢票配置"), visible=True)]
         yield [
-            gr.update(value=withTimeString("详细信息见控制台"), visible=True),
-            gr.update(visible=True),
-            gr.update(),
-            gr.update(),
-            gr.update(),
-            gr.update(),
-            gr.update(),
+            gr.update(value=withTimeString("开始多开抢票,详细查看终端"), visible=True)
         ]
-        while isRunning:
-            try:
-                if time_start != "":
-                    logger.info("0) 等待开始时间")
-                    timeoffset = time_service.get_timeoffset()
-                    logger.info("时间偏差已被设置为: " + str(timeoffset) + 's')
-                    authcode_prepare_flag = 0  # 标记是否已进行预填, 避免重复预填
-                    while isRunning:
-                        try:
-                            time_difference = (
-                                    datetime.strptime(time_start, "%Y-%m-%dT%H:%M:%S").timestamp()
-                                    - time.time() + timeoffset
-                            )
-                        except ValueError as e:
-                            time_difference = (
-                                    datetime.strptime(time_start, "%Y-%m-%dT%H:%M").timestamp()
-                                    - time.time() + timeoffset
-                            )
-                        if time_difference > 0:
-                            if time_difference > 5:
-                                # 抢票验证码预填
-                                if time_difference <= authcode_preorder_time and time_difference > 30 and authcode_prepare_str != "" and authcode_prepare_flag == 0:
-                                    logger.info("开始进行预填验证码, 设定的提前预填时间为: " + str(
-                                        authcode_preorder_time) + "秒")
-                                    yield [
-                                        gr.update(
-                                            value=withTimeString("开始进行预填验证码, 如选择手动模式请注意验证码弹窗。"),
-                                            visible=True),
-                                        gr.update(visible=True),
-                                        gr.update(),
-                                        gr.update(),
-                                        gr.update(),
-                                        gr.update(),
-                                        gr.update(),
-                                    ]
-                                    attempt_times = 2  # 为避免错过开票时间, 最多尝试两次预填
-                                    while attempt_times > 0:
-                                        # ---------验证码预填 BEGIN--------- #
-                                        # 验证码预填只需通过prepare拿到token即可, 无需尝试提交订单
-                                        # 数据准备
-                                        tickets_info = json.loads(authcode_prepare_str)
-                                        _request = main_request
-                                        token_payload = {
-                                            "count": tickets_info["count"],
-                                            "screen_id": tickets_info["screen_id"],
-                                            "order_type": 1,
-                                            "project_id": tickets_info["project_id"],
-                                            "sku_id": tickets_info["sku_id"],
-                                            "token": "",
-                                            "newRisk": True,
-                                        }
-
-                                        # 订单准备
-                                        logger.info(f"预填验证码_订单准备")
-                                        request_result_normal = _request.post(
-                                            url=f"https://show.bilibili.com/api/ticket/order/prepare?project_id={tickets_info['project_id']}",
-                                            data=token_payload,
-                                        )
-                                        request_result = request_result_normal.json()
-                                        logger.info(
-                                            f"请求头: {request_result_normal.headers} // 请求体: {request_result}")
-                                        code = int(request_result["code"])
-                                        # 完成验证码
-                                        if code == -401:
-                                            # if True:
-                                            _url = "https://api.bilibili.com/x/gaia-vgate/v1/register"
-                                            _payload = urlencode(request_result["data"]["ga_data"]["riskParams"])
-                                            _data = _request.post(_url, _payload).json()
-                                            logger.info(
-                                                f"验证码请求: {_data}"
-                                            )
-                                            csrf = _request.cookieManager.get_cookies_value("bili_jct")
-                                            token = _data["data"]["token"]
-                                            if _data["data"]["type"] == "geetest":
-                                                gt = _data["data"]["geetest"]["gt"]
-                                                challenge = _data["data"]["geetest"]["challenge"]
-                                                geetest_validate = ""
-                                                geetest_seccode = ""
-                                                if ways_detail[select_way].have_gt_ui():
-                                                    logger.info(f"Using {ways_detail[select_way]}, have gt ui")
-                                                    yield [
-                                                        gr.update(value=withTimeString("进行验证码验证"), visible=True),
-                                                        gr.update(visible=True),
-                                                        gr.update(),
-                                                        gr.update(visible=True),
-                                                        gr.update(value=gt),
-                                                        gr.update(value=challenge),
-                                                        gr.update(value=uuid.uuid1()),
-                                                    ]
-
-                                                def run_validation():
-                                                    nonlocal geetest_validate, geetest_seccode
-                                                    try:
-                                                        tmp = ways_detail[select_way].validate(appkey=api_key, gt=gt,
-                                                                                               challenge=challenge)
-                                                    except Exception as e:
-                                                        return
-                                                    validate_con.acquire()
-                                                    geetest_validate = tmp
-                                                    geetest_seccode = geetest_validate + "|jordan"
-                                                    validate_con.notify()
-                                                    validate_con.release()
-
-                                                validate_con.acquire()
-                                                while geetest_validate == "" or geetest_seccode == "":
-                                                    threading.Thread(target=run_validation).start()
-                                                    yield [
-                                                        gr.update(value=withTimeString(
-                                                            f"等待验证码完成， 使用{ways[select_way]}"),
-                                                            visible=True),
-                                                        gr.update(visible=True),
-                                                        gr.update(),
-                                                        gr.update(),
-                                                        gr.update(),
-                                                        gr.update(),
-                                                        gr.update(),
-                                                    ]
-                                                    validate_con.wait()
-                                                validate_con.release()
-                                                logger.info(
-                                                    f"geetest_validate: {geetest_validate},geetest_seccode: {geetest_seccode}"
-                                                )
-                                                _url = "https://api.bilibili.com/x/gaia-vgate/v1/validate"
-                                                _payload = {
-                                                    "challenge": challenge,
-                                                    "token": token,
-                                                    "seccode": geetest_seccode,
-                                                    "csrf": csrf,
-                                                    "validate": geetest_validate,
-                                                }
-                                                _data = _request.post(_url, urlencode(_payload)).json()
-                                            elif _data["data"]["type"] == "phone":
-                                                _payload = {
-                                                    "code": global_cookieManager.get_config_value("phone", ""),
-                                                    "csrf": csrf,
-                                                    "token": token,
-                                                }
-                                                _data = _request.post(_url, urlencode(_payload)).json()
-                                            else:
-                                                logger.warning("这个一个程序无法应对的验证码，脚本无法处理")
-                                                break
-                                            logger.info(f"validate: {_data}")
-                                            geetest_validate = ""
-                                            geetest_seccode = ""
-                                            if _data["code"] == 0:
-                                                logger.info('预填验证码成功, 等待开票')
-                                                break
-                                            else:
-                                                logger.warning("预填验证码失败 {}", _data)
-                                                yield [
-                                                    gr.update(value=withTimeString("预填验证码失败。重新验证"),
-                                                              visible=True),
-                                                    gr.update(visible=True),
-                                                    gr.update(),
-                                                    gr.update(),
-                                                    gr.update(),
-                                                    gr.update(),
-                                                    gr.update(),
-                                                ]
-                                                attempt_times += 1
-                                                time.sleep(1)  # 休息1秒, 避免触发风控
-                                        if code == 0:
-                                            logger.info("未出现验证码, IP可能已在白名单中, 跳过验证码预填")
-                                            break
-                                    # ---------验证码预填 END--------- #
-                                    authcode_prepare_flag = 1
-                                # 剩余时间大于5秒时, 每秒渲染一次页面, 渲染后重新计算剩余开票时间, 不会导致剩余时间计算误差累积
-                                else:
-                                    yield [
-                                        gr.update(value="等待中，剩余等待时间: " + (str(int(
-                                            time_difference)) + '秒') if time_difference > 6 else '即将开抢',
-                                                  visible=True),
-                                        gr.update(visible=True),
-                                        gr.update(),
-                                        gr.update(),
-                                        gr.update(),
-                                        gr.update(),
-                                        gr.update(),
-                                    ]
-                                    time.sleep(1)
-                            else:
-                                # 准备倒计时开票, 不再渲染页面, 确保计时准确
-                                # 使用 time.perf_counter() 方法实现高精度计时, 但可能会占用一定的CPU资源
-                                start_time = time.perf_counter()
-                                end_time = start_time + time_difference
-                                current_time = start_time
-                                while current_time < end_time:
-                                    current_time = time.perf_counter()
-                                break
-                            if not isRunning:
-                                # 停止定时抢票
-                                yield [
-                                    gr.update(value='手动停止定时抢票', visible=True),
-                                    gr.update(visible=True),
-                                    gr.update(),
-                                    gr.update(),
-                                    gr.update(),
-                                    gr.update(),
-                                    gr.update(),
-                                ]
-                                logger.info("手动停止定时抢票")
-                                return
-                        else:
-                            break
-                if not isRunning:
-                    gr.update(value="停止", visible=True),
-                    return
-
-                # 数据准备
-                tickets_info = json.loads(tickets_info_str)
-                _request = main_request
-                token_payload = {
-                    "count": tickets_info["count"],
-                    "screen_id": tickets_info["screen_id"],
-                    "order_type": 1,
-                    "project_id": tickets_info["project_id"],
-                    "sku_id": tickets_info["sku_id"],
-                    "token": "",
-                    "newRisk": True,
-                }
-                # 订单准备
-                logger.info(f"1）订单准备")
-                request_result_normal = _request.post(
-                    url=f"https://show.bilibili.com/api/ticket/order/prepare?project_id={tickets_info['project_id']}",
-                    data=token_payload,
+        endpoints = GlobalStatusInstance.available_endpoints()
+        endpoints_next_idx = 0
+        https_proxy_list = ["none"] + https_proxys.split(",")
+        assigned_proxies: list[list[str]] = []
+        assigned_proxies_next_idx = 0
+        for idx, filename in enumerate(files):
+            with open(filename, "r", encoding="utf-8") as file:
+                content = file.read()
+            filename_only = os.path.basename(filename)
+            logger.info(f"启动 {filename_only}")
+            # 先分配worker
+            while endpoints_next_idx < len(endpoints) and terminal_ui == "网页":
+                success = try_assign_endpoint(
+                    endpoints[endpoints_next_idx].endpoint,
+                    payload={
+                        "force": True,
+                        "train_info": content,
+                        "time_start": time_start,
+                        "interval": interval,
+                        "audio_path": audio_path,
+                        "pushplusToken": ConfigDB.get("pushplusToken"),
+                        "serverchanKey": ConfigDB.get("serverchanKey"),
+                        "serverchan3ApiUrl": ConfigDB.get("serverchan3ApiUrl"),
+                        "barkToken": ConfigDB.get("barkToken"),
+                        "ntfy_url": ConfigDB.get("ntfyUrl"),
+                        "ntfy_username": ConfigDB.get("ntfyUsername"),
+                        "ntfy_password": ConfigDB.get("ntfyPassword"),
+                    },
                 )
-                request_result = request_result_normal.json()
-                logger.info(f"请求头: {request_result_normal.headers} // 请求体: {request_result}")
-                code = int(request_result["code"])
-                # 完成验证码
-                if code == -401:
-                    # if True:
-                    _url = "https://api.bilibili.com/x/gaia-vgate/v1/register"
-                    _payload = urlencode(request_result["data"]["ga_data"]["riskParams"])
-                    _data = _request.post(_url, _payload).json()
-                    logger.info(
-                        f"验证码请求: {_data}"
-                    )
-                    csrf = _request.cookieManager.get_cookies_value("bili_jct")
-                    token = _data["data"]["token"]
-                    if _data["data"]["type"] == "geetest":
-                        gt = _data["data"]["geetest"]["gt"]
-                        challenge = _data["data"]["geetest"]["challenge"]
-                        geetest_validate = ""
-                        geetest_seccode = ""
-                        if ways_detail[select_way].have_gt_ui():
-                            logger.info(f"Using {ways_detail[select_way]}, have gt ui")
-                            yield [
-                                gr.update(value=withTimeString("进行验证码验证"), visible=True),
-                                gr.update(visible=True),
-                                gr.update(),
-                                gr.update(visible=True),
-                                gr.update(value=gt),
-                                gr.update(value=challenge),
-                                gr.update(value=uuid.uuid1()),
-                            ]
-
-                        def run_validation():
-                            nonlocal geetest_validate, geetest_seccode
-                            try:
-                                tmp = ways_detail[select_way].validate(appkey=api_key, gt=gt, challenge=challenge)
-                            except Exception as e:
-                                return
-                            validate_con.acquire()
-                            geetest_validate = tmp
-                            geetest_seccode = geetest_validate + "|jordan"
-                            validate_con.notify()
-                            validate_con.release()
-
-                        validate_con.acquire()
-                        while geetest_validate == "" or geetest_seccode == "":
-                            threading.Thread(target=run_validation).start()
-                            yield [
-                                gr.update(value=withTimeString(f"等待验证码完成， 使用{ways[select_way]}"),
-                                          visible=True),
-                                gr.update(visible=True),
-                                gr.update(),
-                                gr.update(),
-                                gr.update(),
-                                gr.update(),
-                                gr.update(),
-                            ]
-                            validate_con.wait()
-                        validate_con.release()
-                        logger.info(
-                            f"geetest_validate: {geetest_validate},geetest_seccode: {geetest_seccode}"
-                        )
-                        _url = "https://api.bilibili.com/x/gaia-vgate/v1/validate"
-                        _payload = {
-                            "challenge": challenge,
-                            "token": token,
-                            "seccode": geetest_seccode,
-                            "csrf": csrf,
-                            "validate": geetest_validate,
-                        }
-                        _data = _request.post(_url, urlencode(_payload)).json()
-                    elif _data["data"]["type"] == "phone":
-                        _payload = {
-                            "code": global_cookieManager.get_config_value("phone", ""),
-                            "csrf": csrf,
-                            "token": token,
-                        }
-                        _data = _request.post(_url, urlencode(_payload)).json()
-                    else:
-                        logger.warning("这个一个程序无法应对的验证码，脚本无法处理")
-                        break
-                    logger.info(f"validate: {_data}")
-                    geetest_validate = ""
-                    geetest_seccode = ""
-                    if _data["code"] == 0:
-                        logger.info("验证码成功")
-                        gr.update(value=withTimeString("验证码成功"), visible=True),
-                        gr.update(visible=True),
-                        gr.update(),
-                        gr.update(),
-                        gr.update(),
-                        gr.update(),
-                        gr.update(),
-                    else:
-                        logger.info("验证码失败 {}", _data)
-                        yield [
-                            gr.update(value=withTimeString("验证码失败。重新验证"), visible=True),
-                            gr.update(visible=True),
-                            gr.update(),
-                            gr.update(),
-                            gr.update(),
-                            gr.update(),
-                            gr.update(),
-                        ]
-                        continue
-                    request_result = _request.post(
-                        url=f"https://show.bilibili.com/api/ticket/order/prepare?project_id={tickets_info['project_id']}",
-                        data=token_payload,
-                    ).json()
-                    logger.info(f"prepare: {request_result}")
-                tickets_info["again"] = 1
-                tickets_info["token"] = request_result["data"]["token"]
-                logger.info(f"2）创建订单")
-                tickets_info["timestamp"] = int(time.time()) * 100
-                payload = format_dictionary_to_string(tickets_info)
-
-                @retry.retry(exceptions=RequestException, tries=60, delay=interval / 1000)
-                def inner_request():
-                    if not isRunning:
-                        raise ValueError("抢票结束")
-                    ret = _request.post(
-                        url=f"https://show.bilibili.com/api/ticket/order/createV2?project_id={tickets_info['project_id']}",
-                        data=payload,
-                    ).json()
-                    err = int(ret["errno"])
-                    logger.info(
-                        f'状态码: {err}({ERRNO_DICT.get(err, "未知错误码")}), 请求体: {ret}'
-                    )
-                    if err == 0 or err == 100048 or err == 100079:
-                        return ret, err
-                    if err == 100051:
-                        raise ValueError("token 过期")
-                    if err != 0:
-                        raise HTTPError("重试次数过多，重新准备订单")
-                    return ret, err
-
-                request_result, errno = inner_request()
-                left_time_str = "无限" if mode == 0 else left_time
-                logger.info(
-                    f'状态码: {errno}({ERRNO_DICT.get(errno, "未知错误码")}), 请求体: {request_result} 剩余次数: {left_time_str}'
-                )
-                yield [
-                    gr.update(
-                        value=withTimeString(
-                            f"正在抢票，具体情况查看终端控制台。\n剩余次数: {left_time_str}\n当前状态码: {errno} ({ERRNO_DICT.get(errno, '未知错误码')})"),
-                        visible=True,
-                    ),
-                    gr.update(visible=True),
-                    gr.update(),
-                    gr.update(),
-                    gr.update(),
-                    gr.update(),
-                    gr.update(),
-                ]
-                if errno == 0:
-                    logger.info(f"3）抢票成功")
-                    qrcode_url = get_qrcode_url(
-                        _request,
-                        request_result["data"]["orderId"],
-                    )
-                    qr_gen = qrcode.QRCode()
-                    qr_gen.add_data(qrcode_url)
-                    qr_gen.make(fit=True)
-                    qr_gen_image = qr_gen.make_image()
-                    yield [
-                        gr.update(value=withTimeString("生成付款二维码"), visible=True),
-                        gr.update(visible=False),
-                        gr.update(value=qr_gen_image.get_image(), visible=True),
-                        gr.update(),
-                        gr.update(),
-                        gr.update(),
-                        gr.update(),
-                    ]
-                    plusToken = configDB.get("plusToken")
-                    if plusToken is not None and plusToken != "":
-                        PlusUtil.send_message(plusToken, "抢票成功", "前往订单中心付款吧")
-                    if audio_path != None:
-                        pygame.mixer.init()
-                        pygame.mixer.music.load(os.path.abspath(audio_path))
-                        logger.info("播放抢票成功提醒音频, 播放次数: "+ str(int(audio_repeat_times)))
-                        for i in range(0,int(audio_repeat_times)):
-                            audio_break_flag = False # True时停止播放
-                            pygame.mixer.music.play()
-                            while pygame.mixer.music.get_busy():
-                                # 等待音频播放完成
-                                pygame.time.wait(100)
-                                if not isRunning:
-                                    pygame.mixer.music.stop()
-                                    audio_break_flag = True
-                                    break
-                            if audio_break_flag == True:
-                                break
+                endpoints_next_idx += 1
+                if success:
                     break
-                if mode == 1:
-                    left_time -= 1
-                    if left_time <= 0:
-                        break
-            except JSONDecodeError as e:
-                logger.error(f"配置文件格式错误: {e}")
-                return [
-                    gr.update(value=withTimeString("配置文件格式错误"), visible=True),
-                    gr.update(visible=True),
-                    gr.update(),
-                    gr.update(),
-                    gr.update(),
-                    gr.update(),
-                    gr.update(),
-                ]
-            except ValueError as e:
-                logger.info(f"{e}")
-                yield [
-                    gr.update(value=withTimeString(f"有错误，具体查看控制台日志\n\n当前错误 {e}"), visible=True),
-                    gr.update(visible=True),
-                    gr.update(),
-                    gr.update(),
-                    gr.update(),
-                    gr.update(),
-                    gr.update(),
-                ]
-            except HTTPError as e:
-                logger.error(f"请求错误: {e}")
-                yield [
-                    gr.update(value=withTimeString(f"有错误，具体查看控制台日志\n\n当前错误 {e}"), visible=True),
-                    gr.update(visible=True),
-                    gr.update(),
-                    gr.update(),
-                    gr.update(),
-                    gr.update(),
-                    gr.update(),
-                ]
-            except Exception as e:
-                logger.exception(e)
-                yield [
-                    gr.update(value=withTimeString(f"有错误，具体查看控制台日志\n\n当前错误 {e}"), visible=True),
-                    gr.update(visible=True),
-                    gr.update(),
-                    gr.update(),
-                    gr.update(),
-                    gr.update(),
-                    gr.update(),
-                ]
-            finally:
-                time.sleep(interval / 1000.0)
+            else:
+                # 再分配https_proxys
+                if assigned_proxies == []:
+                    left_task_num = len(files) - idx
+                    assigned_proxies = split_proxies(https_proxy_list, left_task_num)
 
-        yield [
-            gr.update(value="抢票结束", visible=True),
-            gr.update(visible=False),
-            gr.update(),
-            gr.update(),
-            gr.update(),
-            gr.update(),
-            gr.update(),
-        ]
+                log_file_path = _build_task_log_path(filename_only)
+                logger.info(f"任务 {filename_only} 的日志文件：{log_file_path}")
+                proc = buy_new_terminal(
+                    endpoint_url=demo.local_url,
+                    tickets_info=content,
+                    time_start=time_start,
+                    interval=interval,
+                    audio_path=audio_path,
+                    pushplusToken=ConfigDB.get("pushplusToken"),
+                    serverchanKey=ConfigDB.get("serverchanKey"),
+                    serverchan3ApiUrl=ConfigDB.get("serverchan3ApiUrl"),
+                    barkToken=ConfigDB.get("barkToken"),
+                    ntfy_url=ConfigDB.get("ntfyUrl"),
+                    ntfy_username=ConfigDB.get("ntfyUsername"),
+                    ntfy_password=ConfigDB.get("ntfyPassword"),
+                    https_proxys=",".join(assigned_proxies[assigned_proxies_next_idx]),
+                    terminal_ui=terminal_ui,
+                    show_random_message=not hide_random_message,
+                    log_file_path=log_file_path,
+                )
+                GlobalStatusInstance.register_task_log(
+                    title=filename_only,
+                    mode=terminal_ui,
+                    log_file=log_file_path,
+                    pid=proc.pid,
+                )
+                assigned_proxies_next_idx += 1
+        gr.Info("正在启动，请等待抢票页面弹出。")
 
-    mode_ui.change(
-        fn=lambda x: gr.update(visible=True)
-        if x == 1
-        else gr.update(visible=False),
-        inputs=[mode_ui],
-        outputs=total_attempts_ui,
+    go_btn = gr.Button(
+        "开始抢票",
+        elem_classes="btb-strong-button",
     )
-    with gr.Row():
-        go_btn = gr.Button("开始抢票")
-        stop_btn = gr.Button("停止", visible=False)
 
-    with gr.Row():
-        go_ui = gr.Textbox(
-            info="此窗口为临时输出，具体请见控制台",
-            label="输出信息",
-            interactive=False,
-            visible=False,
-            show_copy_button=True,
-            max_lines=10,
-
-        )
-        qr_image = gr.Image(label="使用微信或者支付宝扫码支付", visible=False, elem_classes="pay_qrcode")
-
-    with gr.Row(visible=False) as gt_row:
-        trigger = gr.Textbox(visible=False)
-        gt_html_finish_btn = gr.Button("完成验证码后点此此按钮")
-        gr.HTML(
-            value="""
-                   <div>
-                   <label>如何点击无效说明，获取验证码失败，请勿多点</label>
-                    <div id="captcha">
-                    </div>
-                </div>""",
-            label="验证码",
-        )
-    geetest_result = gr.JSON(visible=False)
-    time_tmp = gr.Textbox(visible=False)
-    gt_ui = gr.Textbox(visible=False)
-    challenge_ui = gr.Textbox(visible=False)
-    trigger.change(
+    _time_tmp = gr.Textbox(visible=False)
+    _auto_fill_time_tmp = gr.Textbox(visible=False)
+    auto_fill_time_btn.click(
+        fn=auto_fill_time,
+        inputs=upload_ui,
+        outputs=_auto_fill_time_tmp,
+    ).then(
         fn=None,
-        inputs=[gt_ui, challenge_ui],
-        outputs=None,
+        inputs=_auto_fill_time_tmp,
+        outputs=_time_tmp,
         js="""
-            (gt, challenge) => initGeetest({
-                gt, challenge,
-                offline: false,
-                new_captcha: true,
-                product: "popup",
-                width: "300px",
-                https: true
-            }, function (captchaObj) {
-                window.captchaObj = captchaObj;
-                $('#captcha').empty();
-                captchaObj.appendTo('#captcha');
-            })
-            """,
+        (value) => {
+            const input = document.getElementById("datetime");
+            if (input) {
+                input.value = value || "";
+            }
+            return value || "";
+        }
+        """,
     )
-
-    def receive_geetest_result(res):
-        nonlocal geetest_validate, geetest_seccode
-        if "geetest_validate" in res and "geetest_seccode" in res:
-            validate_con.acquire()
-            geetest_validate = res["geetest_validate"]
-            geetest_seccode = res["geetest_seccode"]
-            validate_con.notify()
-            validate_con.release()
-            return gr.update(value=withTimeString(f"验证码获取成功"), visible=True)
-        else:
-            return gr.update(value=withTimeString(f"验证码获取失败"), visible=True)
-
-    gt_html_finish_btn.click(
-        fn=None,
-        inputs=None,
-        outputs=geetest_result,
-        js="() => captchaObj.getValidate()",
-    )
-    gt_html_finish_btn.click(fn=receive_geetest_result, inputs=geetest_result, outputs=go_ui)
-
     go_btn.click(
         fn=None,
         inputs=None,
-        outputs=time_tmp,
+        outputs=_time_tmp,
         js='(x) => document.getElementById("datetime").value',
     )
+    _report_tmp = gr.Button(visible=False)
+    _report_tmp.api_info
 
-    def stop():
-        nonlocal isRunning
-        isRunning = False
+    # hander endpoint hearts
+
+    _end_point_tinput = gr.Textbox(visible=False)
+
+    def report(end_point, detail):
+        now = time.time()
+        GlobalStatusInstance.endpoint_details[end_point] = Endpoint(
+            endpoint=end_point, detail=detail, update_at=now
+        )
+
+    _report_tmp.click(
+        fn=report,
+        inputs=[_end_point_tinput, _time_tmp],  # fake useage
+        api_name="report",
+    )
+
+    def tick():
+        return f"当前时间戳：{int(time.time())}"
+
+    timer = gr.Textbox(label="定时更新", interactive=False, visible=False)
+    demo.load(fn=tick, inputs=None, outputs=timer, every=1)
+
+    @gr.render(inputs=timer)
+    def show_split(text):
+        endpoints = GlobalStatusInstance.available_endpoints()
+        if len(endpoints) != 0:
+            gr.Markdown("## 当前运行终端列表")
+            for endpoint in endpoints:
+                with gr.Row(elem_classes="btb-inline-actions !justify-end"):
+                    gr.Button(
+                        value=f"点击跳转 🚀 {endpoint.endpoint} {endpoint.detail}",
+                        link=endpoint.endpoint,
+                        elem_classes="btb-soft-button",
+                    )
 
     go_btn.click(
         fn=start_go,
-        inputs=[ticket_ui, authcode_prepare_text_ui, authcode_preorder_time_ui, time_tmp, interval_ui, mode_ui,
-                total_attempts_ui, api_key_input_ui, audio_path_ui, audio_repeat_times_ui],
-        outputs=[go_ui, stop_btn, qr_image, gt_row, gt_ui, challenge_ui, trigger],
-    )
-    stop_btn.click(
-        fn=stop,
-        inputs=None,
-        outputs=None,
+        inputs=[
+            upload_ui,
+            _time_tmp,
+            interval_ui,
+            audio_path_ui,
+            https_proxy_ui,
+            terminal_ui,
+            show_random_message_ui,
+        ],
     )
